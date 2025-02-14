@@ -1,221 +1,195 @@
 #!/bin/bash
 
-# Function to update the system
-function update_system() {
-    echo "Updating the system..."
-    apt update
-    apt upgrade -y
+if [ "$EUID" -ne 0 ]; then 
+    echo "This script must be run as root"
+    exit 1
+fi
+
+# Store the script's directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+install_wireguard() {
+    echo "Installing WireGuard and dependencies..."
+    apt update > /dev/null 2>&1
+    apt install -y wireguard qrencode > /dev/null 2>&1
+    echo "Installation complete"
 }
 
-# Function to install WireGuard
-function install_wireguard() {
-    echo "Installing WireGuard..."
-    apt install -y wireguard
-}
-
-# Function to upgrade WireGuard to the latest version
-function upgrade_wireguard() {
-    echo "Upgrading WireGuard to the latest version..."
-    add-apt-repository -y ppa:wireguard/wireguard
-    apt update
-    apt upgrade -y wireguard
-}
-
-# Function to generate private and public keys
-function generate_keys() {
-    echo "Generating private and public keys..."
-    umask 077
-    wg genkey | tee /etc/wireguard/privatekey | wg pubkey | tee /etc/wireguard/publickey
-    chmod 600 /etc/wireguard/privatekey
-}
-
-# Function to install QR Code package
-function install_qrcode() {
-    apt install -y qrencode
-}
-
-# Function to configure WireGuard on the server
-function configure_wireguard() {
-    echo "Configuring WireGuard server..."
-    cat << EOF > /etc/wireguard/wg0.conf
+setup_server() {
+    echo "Setting up WireGuard server..."
+    mkdir -p /etc/wireguard
+    cd /etc/wireguard
+    chmod 700 /etc/wireguard
+    
+    # Enable IP forwarding for both IPv4 and IPv6
+    cat > /etc/sysctl.d/99-wireguard.conf << EOF
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+    sysctl -p /etc/sysctl.d/99-wireguard.conf > /dev/null 2>&1
+    
+    # Clear existing iptables rules
+    echo "Configuring firewall rules..."
+    iptables -F
+    iptables -t nat -F
+    ip6tables -F
+    ip6tables -t nat -F
+    
+    # Add IPv4 rules
+    iptables -A FORWARD -i wg0 -j ACCEPT
+    iptables -A FORWARD -o wg0 -j ACCEPT
+    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o eth0 -j MASQUERADE
+    
+    # Add IPv6 rules
+    ip6tables -A FORWARD -i wg0 -j ACCEPT
+    ip6tables -A FORWARD -o wg0 -j ACCEPT
+    ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    
+    # Generate server keys
+    echo "Generating server keys..."
+    wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+    chmod 600 /etc/wireguard/server_private.key
+    
+    SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key)
+    
+    # Detect the correct network interface
+    INTERFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+    SERVER_IPV4=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+    
+    echo "Using network interface: ${INTERFACE}"
+    
+    # Updated server configuration with both IPv4 and IPv6 and comprehensive rules
+    cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
-Address = 10.0.0.1/24
-PrivateKey = $(cat /etc/wireguard/privatekey)
-SaveConfig = true
+PrivateKey = ${SERVER_PRIVATE_KEY}
+Address = 10.66.66.1/24, fd00:1234:5678:9abc::1/64
 ListenPort = 51820
-MTU = 1420        # Increased MTU to avoid fragmentation
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-PersistentKeepalive = 25
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${INTERFACE} -j MASQUERADE; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${INTERFACE} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -A FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${INTERFACE} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${INTERFACE} -j MASQUERADE; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${INTERFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${INTERFACE} -j MASQUERADE
 EOF
-    chmod 600 /etc/wireguard/wg0.conf
-}
-
-# Function to enable IP forwarding
-function enable_ip_forwarding() {
-    echo "Enabling IP forwarding..."
-    echo "net.ipv4.ip_forward=1" | tee -a /etc/sysctl.conf
-    sysctl -p
-}
-
-# Function to enable TCP optimizations
-function enable_tcp_optimizations() {
-    echo "Enabling TCP optimizations..."
-    sysctl -w net.ipv4.tcp_window_scaling=1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 4194304"
-    sysctl -w net.ipv4.tcp_wmem="4096 87380 4194304"
-    sysctl -w net.core.rmem_max=16777216
-    sysctl -w net.core.wmem_max=16777216
-    sysctl -p
-}
-
-# Function to enable crypto hardware acceleration if supported
-function enable_crypto_acceleration() {
-    echo "Checking and enabling crypto hardware acceleration..."
-    if lscpu | grep -q avx2; then
-        echo "AVX2 supported, optimizing WireGuard performance..."
-        modprobe wireguard
+    
+    # Enable and start WireGuard
+    echo "Enabling and starting WireGuard service..."
+    systemctl enable wg-quick@wg0 > /dev/null 2>&1
+    systemctl restart wg-quick@wg0 > /dev/null 2>&1
+    
+    # Verify setup
+    echo "Verifying WireGuard setup..."
+    if systemctl is-active --quiet wg-quick@wg0; then
+        echo "WireGuard is running successfully"
+        echo "Server IP: ${SERVER_IPV4}"
+        echo "Interface: ${INTERFACE}"
     else
-        echo "No AVX2 support. Skipping crypto acceleration."
+        echo "Error: WireGuard failed to start"
+        echo "Check logs with: journalctl -xeu wg-quick@wg0"
+        return 1
     fi
+    
+    # Save iptables rules to persist after reboot
+    echo "Saving firewall rules..."
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save > /dev/null 2>&1
+    else
+        apt-get install -y iptables-persistent > /dev/null 2>&1
+        netfilter-persistent save > /dev/null 2>&1
+    fi
+    
+    echo "Server setup complete"
 }
 
-# Function to configure firewall with optimizations for better speed
-function configure_firewall() {
-    echo "Configuring firewall with optimizations..."
-    ufw allow 22
-    ufw allow 51820/udp
-    ufw default allow FORWARD
-    ufw enable
-    ufw allow OpenSSH
-
-    # Tighten firewall rules for better performance
-    ufw logging off
-    ufw default deny incoming
-    ufw default allow outgoing
-}
-
-# Function to configure WireGuard client with higher MTU and optimizations
-function configure_client() {
-    echo "Configuring WireGuard client..."
-    cat << EOF > /etc/wireguard/client.conf
-[Interface]
-PrivateKey = $(cat /etc/wireguard/privatekey)
-Address = 10.0.0.2/24
-MTU = 1420        # Ensure MTU is consistent between server and client
+add_mobile_client() {
+    echo "Adding new mobile client..."
+    read -p "Enter client number: " CLIENT_NUM
+    
+    if ! [[ "$CLIENT_NUM" =~ ^[0-9]+$ ]]; then
+        echo "Error: Please enter a valid number"
+        return 1
+    fi
+    
+    mkdir -p /etc/wireguard/mobile_clients
+    mkdir -p "${SCRIPT_DIR}/clients"
+    
+    CLIENT_PRIVATE_KEY=$(wg genkey)
+    CLIENT_PUBLIC_KEY=$(echo "${CLIENT_PRIVATE_KEY}" | wg pubkey)
+    SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
+    SERVER_IPV4=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+    
+    # Updated client IP addresses to include both IPv4 and IPv6
+    CLIENT_IPV4="10.66.66.${CLIENT_NUM}/24"
+    CLIENT_IPV6="fd00:1234:5678:9abc::${CLIENT_NUM}/64"
+    
+    # Updated client configuration with both IPv4 and IPv6
+    CONFIG_CONTENT="[Interface]
+PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${CLIENT_IPV4}, ${CLIENT_IPV6}
+DNS = 8.8.8.8, 2606:4700:4700::1111
 
 [Peer]
-PublicKey = $(cat /etc/wireguard/publickey)
-AllowedIPs = 0.0.0.0/0
-Endpoint = $(curl -s ifconfig.me):51820
-PersistentKeepalive = 25
-EOF
-    chmod 600 /etc/wireguard/client.conf
-}
+PublicKey = ${SERVER_PUBLIC_KEY}
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = ${SERVER_IPV4}:51820
+PersistentKeepalive = 25"
 
-# Function to restart WireGuard with updated configuration
-function restart_wireguard() {
-    echo "Restarting WireGuard..."
-    wg-quick down wg0
-    wg-quick up wg0
-}
-
-# Function to show WireGuard status
-function show_wireguard_status() {
-    echo "WireGuard Status:"
-    systemctl status wg-quick@wg0.service --no-pager
-}
-
-# Function to list connected clients
-function list_connected_clients() {
-    echo "Connected Clients:"
-    wg show wg0
-}
-
-# Function to monitor client connections
-function monitor_client_connections() {
-    echo "Monitoring client connections..."
-    echo "Displaying connection stats for each peer (packets sent, received, and latest handshake):"
-    wg show wg0
-}
-
-# Function to add a new peer to the WireGuard configuration
-function add_peer() {
-    wg-quick up wg0
-    echo "Adding a new peer to the WireGuard configuration..."
-    privatekey=$(wg genkey)
-    publickey=$(echo $privatekey | wg pubkey)
-
-    read -p "Enter the IP address for the new peer (e.g., 10.0.0.5): " ip
-
-    cat << EOF > /etc/wireguard/client_$ip.conf
-[Interface]
-PrivateKey = $privatekey
-Address = $ip/24
+    # Save config in WireGuard directory
+    echo "$CONFIG_CONTENT" > "/etc/wireguard/mobile_clients/mobile_${CLIENT_NUM}.conf"
+    
+    # Save config in script directory
+    echo "$CONFIG_CONTENT" > "${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
+    
+    # Updated peer configuration in server config with both IPv4 and IPv6
+    cat >> /etc/wireguard/wg0.conf << EOF
 
 [Peer]
-PublicKey = $(cat /etc/wireguard/publickey)
-AllowedIPs = 0.0.0.0/0
-Endpoint = $(curl -s ifconfig.me):51820
-PersistentKeepalive = 25
-
+PublicKey = ${CLIENT_PUBLIC_KEY}
+AllowedIPs = 10.66.66.${CLIENT_NUM}/32, fd00:1234:5678:9abc::${CLIENT_NUM}/128
 EOF
-
-    wg set wg0 peer $publickey allowed-ips $ip
-    qrencode -t ansiutf8 < /etc/wireguard/client_$ip.conf
+    
+    echo "Generating QR code for client ${CLIENT_NUM}..."
+    qrencode -t ansiutf8 < "${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
+    
+    systemctl restart wg-quick@wg0 > /dev/null 2>&1
+    
+    echo "Client ${CLIENT_NUM} added successfully"
+    echo "Configuration files saved in:"
+    echo "1. /etc/wireguard/mobile_clients/mobile_${CLIENT_NUM}.conf"
+    echo "2. ${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
 }
 
-# Function to enable AVX2 if supported
-function enable_avx2() {
-    echo "Checking for AVX2 support..."
-    if grep -q avx2 /proc/cpuinfo; then
-        echo "AVX2 is supported. Optimizing WireGuard..."
-        modprobe wireguard
-    else
-        echo "AVX2 is not supported on this CPU. Skipping optimization."
-    fi
+show_menu() {
+    clear
+    echo "=== WireGuard Setup Menu ==="
+    echo "1. Install WireGuard"
+    echo "2. Setup WireGuard Server"
+    echo "3. Add Mobile Client"
+    echo "4. Exit"
+    echo "=========================="
 }
 
-# Main script execution
-echo "WireGuard Server Setup"
-echo "----------------------"
-echo "Please select an option:"
-echo "1. Update the system"
-echo "2. Install WireGuard"
-echo "3. Generate keys"
-echo "4. Configure WireGuard"
-echo "5. Enable IP forwarding"
-echo "6. Enable TCP optimizations"
-echo "7. Enable Crypto acceleration (AVX2)"
-echo "8. Configure firewall"
-echo "9. Configure WireGuard Client"
-echo "a. Restart WireGuard"
-echo "b. Show WireGuard Status"
-echo "c. List Connected Clients"
-echo "d. Monitor Client Connections (Packets Sent/Received)"
-echo "e. Add a peer"
-echo "f. Install QR Code package"
-echo "g. Upgrade WireGuard to latest version"
-
-read -p "Enter the option number: " option
-
-# Main script execution based on user input
-case $option in
-    1) update_system ;;
-    2) install_wireguard ;;
-    3) generate_keys ;;
-    4) configure_wireguard ;;
-    5) enable_ip_forwarding ;;
-    6) enable_tcp_optimizations ;;
-    7) enable_crypto_acceleration ;;
-    8) configure_firewall ;;
-    9) configure_client ;;
-    a) restart_wireguard ;;
-    b) show_wireguard_status ;;
-    c) list_connected_clients ;;
-    d) monitor_client_connections ;;
-    e) add_peer ;;
-    f) install_qrcode ;;
-    g) upgrade_wireguard ;;
-    *) echo "Invalid option selected" ;;
-esac
+while true; do
+    show_menu
+    read -p "Enter your choice [1-4]: " choice
+    
+    case $choice in
+        1)
+            install_wireguard
+            read -p "Press Enter to continue..."
+            ;;
+        2)
+            setup_server
+            read -p "Press Enter to continue..."
+            ;;
+        3)
+            add_mobile_client
+            read -p "Press Enter to continue..."
+            ;;
+        4)
+            echo "Exiting..."
+            exit 0
+            ;;
+        *)
+            echo "Invalid option. Please try again."
+            read -p "Press Enter to continue..."
+            ;;
+    esac
+done
