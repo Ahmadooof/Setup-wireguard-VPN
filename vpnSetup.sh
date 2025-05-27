@@ -132,63 +132,95 @@ EOF
 add_mobile_client() {
     echo "Adding new mobile client..."
     read -p "Enter client number: " CLIENT_NUM
-    
+
     if ! [[ "$CLIENT_NUM" =~ ^[0-9]+$ ]]; then
         echo "Error: Please enter a valid number"
         return 1
     fi
-    
+
     # Check if client number already exists
-    if grep -q "10.66.66.${CLIENT_NUM}/32" /etc/wireguard/wg0.conf 2>/dev/null; then
+    if grep -q "10.66.66.${CLIENT_NUM}/32" /etc/wireguard/wg0.conf 2>/dev/null || \
+       grep -q "fd00:1234:5678:9abc::${CLIENT_NUM}/128" /etc/wireguard/wg0.conf 2>/dev/null; then
         echo "Error: Client ${CLIENT_NUM} already exists"
         return 1
     fi
-    
+
+    echo "Choose client IP version:"
+    echo "1. IPv4 only"
+    echo "2. IPv6 only"
+    echo "3. Both IPv4 and IPv6"
+    read -p "Enter your choice [1-3]: " ip_choice
+
+    case $ip_choice in
+        1)
+            CLIENT_ADDRESS="10.66.66.${CLIENT_NUM}/24"
+            CLIENT_ALLOWED_IPS="10.66.66.${CLIENT_NUM}/32"
+            DNS="8.8.8.8"
+            read -p "Enter server's public IPv4 address: " SERVER_ENDPOINT
+            ENDPOINT="${SERVER_ENDPOINT}:51820"
+            ;;
+        2)
+            CLIENT_ADDRESS="fd00:1234:5678:9abc::${CLIENT_NUM}/64"
+            CLIENT_ALLOWED_IPS="fd00:1234:5678:9abc::${CLIENT_NUM}/128"
+            DNS="2606:4700:4700::1111"
+            read -p "Enter server's public IPv6 address: " SERVER_ENDPOINT
+            ENDPOINT="[${SERVER_ENDPOINT}]:51820"
+            ;;
+        3)
+            CLIENT_ADDRESS="10.66.66.${CLIENT_NUM}/24, fd00:1234:5678:9abc::${CLIENT_NUM}/64"
+            CLIENT_ALLOWED_IPS="10.66.66.${CLIENT_NUM}/32, fd00:1234:5678:9abc::${CLIENT_NUM}/128"
+            DNS="8.8.8.8, 2606:4700:4700::1111"
+            read -p "Enter server's public IPv4 address: " SERVER_ENDPOINT4
+            read -p "Enter server's public IPv6 address: " SERVER_ENDPOINT6
+            # You can choose which to use as default, or let user pick
+            ENDPOINT="[${SERVER_ENDPOINT6}]:51820"
+            ;;
+        *)
+            echo "Invalid choice"
+            return 1
+            ;;
+    esac
+
     mkdir -p /etc/wireguard/mobile_clients
     mkdir -p "${SCRIPT_DIR}/clients"
-    
+
     CLIENT_PRIVATE_KEY=$(wg genkey)
     CLIENT_PUBLIC_KEY=$(echo "${CLIENT_PRIVATE_KEY}" | wg pubkey)
     SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server_public.key)
-    SERVER_IPV4=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
-    
-    # Client IP addresses
-    CLIENT_IPV4="10.66.66.${CLIENT_NUM}/24"
-    CLIENT_IPV6="fd00:1234:5678:9abc::${CLIENT_NUM}/64"
-    
+
     # Client configuration
     CONFIG_CONTENT="[Interface]
 PrivateKey = ${CLIENT_PRIVATE_KEY}
-Address = ${CLIENT_IPV4}, ${CLIENT_IPV6}
-DNS = 8.8.8.8, 2606:4700:4700::1111
+Address = ${CLIENT_ADDRESS}
+DNS = ${DNS}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${SERVER_IPV4}:51820
+Endpoint = ${ENDPOINT}
 PersistentKeepalive = 25"
 
     # Save config files
     echo "$CONFIG_CONTENT" > "/etc/wireguard/mobile_clients/mobile_${CLIENT_NUM}.conf"
     echo "$CONFIG_CONTENT" > "${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
-    
+
     # Add peer to server configuration
     cat >> /etc/wireguard/wg0.conf << EOF
 
 [Peer]
 PublicKey = ${CLIENT_PUBLIC_KEY}
-AllowedIPs = 10.66.66.${CLIENT_NUM}/32, fd00:1234:5678:9abc::${CLIENT_NUM}/128
+AllowedIPs = ${CLIENT_ALLOWED_IPS}
 EOF
-    
+
     echo "Generating QR code for client ${CLIENT_NUM}..."
     echo "Scan this QR code with your WireGuard mobile app:"
     echo "================================================"
     qrencode -t ansiutf8 < "${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
     echo "================================================"
-    
+
     # Restart WireGuard to apply new peer
     systemctl restart wg-quick@wg0 > /dev/null 2>&1
-    
+
     echo "✓ Client ${CLIENT_NUM} added successfully"
     echo "Configuration files saved in:"
     echo "1. /etc/wireguard/mobile_clients/mobile_${CLIENT_NUM}.conf"
