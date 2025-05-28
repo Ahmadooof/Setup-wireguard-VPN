@@ -10,11 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 install_wireguard() {
     echo "Installing WireGuard and dependencies..."
-    apt update > /dev/null 2>&1
-    apt install -y wireguard qrencode iptables-persistent > /dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt update
+    DEBIAN_FRONTEND=noninteractive apt install -y wireguard qrencode iptables-persistent
     echo "Installation complete"
 }
-
 setup_server() {
     echo "Setting up WireGuard server..."
     mkdir -p /etc/wireguard
@@ -53,32 +52,29 @@ EOF
     ip6tables -A INPUT -p udp --dport 51820 -j ACCEPT
     ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
     
-    # WireGuard FORWARD rules
-    iptables -A FORWARD -i wg0 -j ACCEPT
-    iptables -A FORWARD -o wg0 -j ACCEPT
-    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
-    ip6tables -A FORWARD -i wg0 -j ACCEPT
-    ip6tables -A FORWARD -o wg0 -j ACCEPT
-    ip6tables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
     # Detect the correct network interface
     INTERFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+    if [ -z "$INTERFACE" ]; then
+        # Fallback method if the first method fails
+        INTERFACE=$(ip link show | grep -v lo | grep -v wg | grep -v docker | grep -v veth | grep -v br- | grep -v "LOOPBACK" | grep "state UP" | head -n 1 | awk -F: '{print $2}' | tr -d ' ')
+    fi
+    
+    # If still empty, ask the user
+    if [ -z "$INTERFACE" ]; then
+        echo "Could not automatically detect network interface."
+        echo "Available interfaces:"
+        ip -o link show | grep -v LOOPBACK | awk -F': ' '{print $2}'
+        read -p "Please enter your network interface name: " INTERFACE
+    fi
+    
     SERVER_IPV4=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
+    SERVER_IPV6=$(ip -6 addr show | grep -oP '(?<=inet6\s)[\da-f:]+' | grep -v '^::1' | grep -v '^fe80' | head -n 1)
     
     echo "Using network interface: ${INTERFACE}"
-    echo "Server IP: ${SERVER_IPV4}"
-    
-    # NAT rules for WireGuard traffic
-    iptables -t nat -A POSTROUTING -o ${INTERFACE} -j MASQUERADE
-    iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${INTERFACE} -j MASQUERADE
-    ip6tables -t nat -A POSTROUTING -o ${INTERFACE} -j MASQUERADE
-    
-    # Set default policies (optional - be careful with DROP)
-    # iptables -P INPUT DROP
-    # iptables -P FORWARD DROP
-    # ip6tables -P INPUT DROP
-    # ip6tables -P FORWARD DROP
+    echo "Server IPv4: ${SERVER_IPV4}"
+    if [ -n "$SERVER_IPV6" ]; then
+        echo "Server IPv6: ${SERVER_IPV6}"
+    fi
     
     # Generate server keys
     echo "Generating server keys..."
@@ -87,24 +83,23 @@ EOF
     
     SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key)
     
-    # Create WireGuard server configuration
+    # Create WireGuard server configuration with explicit interface name
     cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${SERVER_PRIVATE_KEY}
 Address = 10.66.66.1/24, fd00:1234:5678:9abc::1/64
 ListenPort = 51820
-PostUp = iptables -I INPUT -p udp --dport 51820 -j ACCEPT; iptables -I FORWARD -i wg0 -j ACCEPT; iptables -I FORWARD -o wg0 -j ACCEPT; iptables -t nat -I POSTROUTING -o ${INTERFACE} -j MASQUERADE; ip6tables -I FORWARD -i wg0 -j ACCEPT; ip6tables -I FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -I POSTROUTING -o ${INTERFACE} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport 51820 -j ACCEPT; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${INTERFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${INTERFACE} -j MASQUERADE
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o ${INTERFACE} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -A FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -s fd00:1234:5678:9abc::/64 -o ${INTERFACE} -j MASQUERADE; iptables -A OUTPUT -o wg0 -p udp --dport 53 -j ACCEPT; ip6tables -A OUTPUT -o wg0 -p udp --dport 53 -j ACCEPT
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o ${INTERFACE} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -s fd00:1234:5678:9abc::/64 -o ${INTERFACE} -j MASQUERADE; iptables -D OUTPUT -o wg0 -p udp --dport 53 -j ACCEPT; ip6tables -D OUTPUT -o wg0 -p udp --dport 53 -j ACCEPT
 EOF
     
     # Save iptables rules to persist after reboot
-    echo "Saving firewall rules..."
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save > /dev/null 2>&1
     else
-        # Fallback for systems without netfilter-persistent
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
     fi
     
     # Enable and start WireGuard
@@ -155,25 +150,24 @@ add_mobile_client() {
         1)
             CLIENT_ADDRESS="10.66.66.${CLIENT_NUM}/24"
             CLIENT_ALLOWED_IPS="10.66.66.${CLIENT_NUM}/32"
-            DNS="8.8.8.8"
+            DNS="1.1.1.2, 9.9.9.9"
             read -p "Enter server's public IPv4 address: " SERVER_ENDPOINT
             ENDPOINT="${SERVER_ENDPOINT}:51820"
             ;;
         2)
             CLIENT_ADDRESS="fd00:1234:5678:9abc::${CLIENT_NUM}/64"
             CLIENT_ALLOWED_IPS="fd00:1234:5678:9abc::${CLIENT_NUM}/128"
-            DNS="2606:4700:4700::1111"
+            DNS="2606:4700:4700::1112, 2620:fe::9"
             read -p "Enter server's public IPv6 address: " SERVER_ENDPOINT
             ENDPOINT="[${SERVER_ENDPOINT}]:51820"
             ;;
         3)
             CLIENT_ADDRESS="10.66.66.${CLIENT_NUM}/24, fd00:1234:5678:9abc::${CLIENT_NUM}/64"
             CLIENT_ALLOWED_IPS="10.66.66.${CLIENT_NUM}/32, fd00:1234:5678:9abc::${CLIENT_NUM}/128"
-            DNS="8.8.8.8, 2606:4700:4700::1111"
+            DNS="1.1.1.2, 9.9.9.9, 2606:4700:4700::1112, 2620:fe::9"
             read -p "Enter server's public IPv4 address: " SERVER_ENDPOINT4
-            read -p "Enter server's public IPv6 address: " SERVER_ENDPOINT6
-            # You can choose which to use as default, or let user pick
-            ENDPOINT="[${SERVER_ENDPOINT6}]:51820"
+            # Use IPv4 as the primary endpoint for better compatibility
+            ENDPOINT="${SERVER_ENDPOINT4}:51820"
             ;;
         *)
             echo "Invalid choice"
@@ -227,6 +221,77 @@ EOF
     echo "2. ${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
 }
 
+list_clients() {
+    echo "=== WireGuard Clients ==="
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        echo "Client list:"
+        grep -n "\[Peer\]" /etc/wireguard/wg0.conf | while read -r line; do
+            line_num=$(echo "$line" | cut -d: -f1)
+            next_line=$((line_num + 2))
+            ip_line=$(sed -n "${next_line}p" /etc/wireguard/wg0.conf)
+            client_ip=$(echo "$ip_line" | grep -oP 'AllowedIPs\s*=\s*\K[^,]+')
+            client_num=$(echo "$client_ip" | grep -oP '10\.66\.66\.(\d+)' | cut -d. -f4 | cut -d/ -f1)
+            if [ -n "$client_num" ]; then
+                echo "Client $client_num: $client_ip"
+            else
+                client_num=$(echo "$client_ip" | grep -oP 'fd00:1234:5678:9abc::(\d+)' | cut -d: -f8 | cut -d/ -f1)
+                if [ -n "$client_num" ]; then
+                    echo "Client $client_num: $client_ip (IPv6)"
+                fi
+            fi
+        done
+    else
+        echo "WireGuard configuration not found"
+    fi
+}
+
+remove_client() {
+    echo "=== Remove WireGuard Client ==="
+    list_clients
+    read -p "Enter client number to remove: " CLIENT_NUM
+    
+    if ! [[ "$CLIENT_NUM" =~ ^[0-9]+$ ]]; then
+        echo "Error: Please enter a valid number"
+        return 1
+    fi
+    
+    # Find and remove client from config
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        # Create temp file
+        TEMP_FILE=$(mktemp)
+        
+        # Find the start line of the peer section for this client
+        START_LINE=$(grep -n "AllowedIPs.*10\.66\.66\.${CLIENT_NUM}/32\|AllowedIPs.*fd00:1234:5678:9abc::${CLIENT_NUM}/128" /etc/wireguard/wg0.conf | cut -d: -f1)
+        
+        if [ -z "$START_LINE" ]; then
+            echo "Error: Client ${CLIENT_NUM} not found"
+            rm "$TEMP_FILE"
+            return 1
+        fi
+        
+        # Find the peer section start (2 lines before AllowedIPs)
+        PEER_START=$((START_LINE - 2))
+        
+        # Remove the peer section (3 lines total)
+        sed -e "${PEER_START},${START_LINE}d" /etc/wireguard/wg0.conf > "$TEMP_FILE"
+        
+        # Replace the original file
+        cat "$TEMP_FILE" > /etc/wireguard/wg0.conf
+        rm "$TEMP_FILE"
+        
+        # Remove client config files
+        rm -f "/etc/wireguard/mobile_clients/mobile_${CLIENT_NUM}.conf"
+        rm -f "${SCRIPT_DIR}/clients/mobile_${CLIENT_NUM}.conf"
+        
+        # Restart WireGuard
+        systemctl restart wg-quick@wg0 > /dev/null 2>&1
+        
+        echo "✓ Client ${CLIENT_NUM} removed successfully"
+    else
+        echo "WireGuard configuration not found"
+    fi
+}
+
 show_status() {
     echo "=== WireGuard Status ==="
     echo "Service status:"
@@ -245,15 +310,17 @@ show_menu() {
     echo "1. Install WireGuard"
     echo "2. Setup WireGuard Server"
     echo "3. Add Mobile Client"
-    echo "4. Show Status"
-    echo "5. Exit"
+    echo "4. List Clients"
+    echo "5. Remove Client"
+    echo "6. Show Status"
+    echo "7. Exit"
     echo "=========================="
 }
 
 # Main menu loop
 while true; do
     show_menu
-    read -p "Enter your choice [1-5]: " choice
+    read -p "Enter your choice [1-7]: " choice
     
     case $choice in
         1)
@@ -269,10 +336,18 @@ while true; do
             read -p "Press Enter to continue..."
             ;;
         4)
-            show_status
+            list_clients
             read -p "Press Enter to continue..."
             ;;
         5)
+            remove_client
+            read -p "Press Enter to continue..."
+            ;;
+        6)
+            show_status
+            read -p "Press Enter to continue..."
+            ;;
+        7)
             echo "Exiting..."
             exit 0
             ;;
